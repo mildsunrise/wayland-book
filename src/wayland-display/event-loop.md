@@ -37,10 +37,9 @@ occurs on that file descriptor. You will also need to call
 
 ## Wayland client event loop
 
-libwayland-client, on the other hand, does not have its own event loop. However,
-since there is only generally one file descriptor, it's easier to manage
-without. If Wayland events are the only sort which your program expects, then
-this simple loop will suffice:
+libwayland-client, on the other hand, implements a small event loop for simple
+programs where activity on one `wl_display` is the only event source. In that
+case, this simple loop will suffice:
 
 ```c
 while (wl_display_dispatch(display) != -1) {
@@ -48,11 +47,99 @@ while (wl_display_dispatch(display) != -1) {
 }
 ```
 
-However, if you have a more sophisticated application, you can build your own
-event loop in any manner you please, and obtain the Wayland display's file
-descriptor with `wl_display_get_fd`. Upon `POLLIN` events, call
-`wl_display_dispatch` to process incoming events. To flush outgoing requests,
-call `wl_display_flush`.
+`wl_display_dispatch` performs one iteration of the built-in event loop,
+and along with other methods like `wl_display_roundtrip` belongs to the
+blocking I/O API of libwayland-client. If Wayland events are the only sort
+which your program expects, this API is fine and you may skip the rest of
+this section. More sophisticated applications need to use the non-blocking
+I/O API, where `wl_display_dispatch` is replaced by a combination of:
+
+- `wl_display_get_fd`: returns the FD to poll for `POLLIN` (its ownership
+  remains with libwayland-client).
+
+- `wl_display_prepare_read`: signals a thread's intention to read events from
+  the socket, and must be paired one-to-one with a following call to
+  `wl_display_read_events` or `wl_display_cancel_read` on the same thread.
+  Calling either of these two methods without first calling
+  `wl_display_prepare_read`, as well as calling `wl_display_prepare_read` twice
+  in the same thread, will likely result in deadlocks.
+
+- `wl_display_read_events`: reads all events available on the socket but does
+  not dispatch them. It never blocks, instead it returns successfully once
+  the socket read yields `EAGAIN`.
+
+- `wl_display_dispatch_pending`: this function doesn't do any I/O, it just
+  dispatches pending events if any. To ensure that the event loop isn't put
+  to sleep while there are events pending, `wl_display_prepare_read` will fail
+  with `EAGAIN` if the queue is not empty. In that case you should call
+  `wl_display_dispatch_pending` and try again.
+
+- `wl_display_flush`: attempts to flush any pending requests to the socket,
+  returning successfully if all events were written or failing with `EAGAIN`
+  if some remain, in which case you should call it again once the FD reports
+  `POLLOUT`.
+
+Usage of the non-blocking I/O API can be tricky, but it boils down to:
+
+- Before the event loop is put to sleep (with e.g. `poll`) the very last
+  tasks should be:
+  - A successful call to `wl_display_prepare_read` (this ensures no other
+    thread will read from the socket before our sleep, which would result
+    in some events left undispatched before a potentially infinite sleep).
+  - A successful (or `EAGAIN`) call to `wl_display_flush` (this ensures
+    no requests are left unsent before a potentially indefinite sleep).
+- Once the event loop gets out of sleep, the very first task should be
+  a call to `wl_display_read_events` (or `wl_display_cancel_read` if the
+  event loop is exiting).
+
+This is how an iteration of your event loop would look like, excluding error
+checking:
+
+```c
+while (wl_display_prepare_read(display) != 0)
+    wl_display_dispatch_pending(display);
+
+ret = wl_display_flush(display);
+if (ret >= 0)
+    fds[WAYLAND_FD_IDX].events &= ~POLLOUT;
+else if (ret < 0 && errno == EAGAIN)
+    fds[WAYLAND_FD_IDX].events |= POLLOUT;
+
+ret = poll(fds, nfds, -1);
+if (has_error(ret)) {
+    wl_display_cancel_read(display);
+    break;
+}
+wl_display_read_events(display);
+
+// act on poll results...
+```
+
+You may find it odd that integrating libwayland-client requires putting these
+tasks strictly around the poll call, or that `wl_display_prepare_read` and
+`wl_display_read_events` are performed unconditionally rather than only in
+iterations where poll signals `POLLIN` for the FD. This is for two reasons;
+first, other threads in your application (possibly from your dependencies, like
+a GUI toolkit) might be doing I/O on your display. But even if you only have
+one thread, if *any* work of your event loop happens to block on `wl_display`
+I/O (either because it calls the blocking I/O API directly or something more
+subtle, like locking a mutex held by a thread doing that) that would result in
+a deadlock if you've started a `wl_display_prepare_read` but not ended it yet.
+
+As for `wl_display_flush` and `wl_display_dispatch_pending`, calling them right
+before polling ensures all events and requests in the queue have been handled
+when the thread is put to sleep. This is a minimum, but specialized event loops
+may wish to call them at other points too.
+
+So in summary, it *is* possible to relax some of these integration requirements
+but that demands extreme care in how the `wl_display` is used by you *and* your
+dependencies; as an example, the Mesa EGL integration described later in
+this book currently uses blocking I/O under the hood when invoked e.g.
+through `eglSwapBuffers`. Mesa will be careful to create its own queue and only
+dispatch that queue, so that only Wayland events destined to Mesa are
+dispatched while execution is in one of its functions. But it still needs to
+read events from the `wl_display`, so when the function returns there might be
+new events pending to be dispatched by calling `wl_display_dispatch_pending`.
 
 ## Almost there!
 
